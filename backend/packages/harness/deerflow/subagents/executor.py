@@ -606,10 +606,12 @@ class SubagentExecutor:
             )
 
         # P1/P2 fix: pass thinking_enabled and reasoning_effort from subagent config
-        # so subagents inherit the same model-behavior settings as their lead persona
+        # so subagents inherit the same model-behavior settings as their lead persona.
+        # ``reasoning_effort`` is not an explicit create_chat_model parameter, so it
+        # travels through **kwargs.  ``thinking_enabled`` IS an explicit parameter;
+        # passing it both as a named arg and via **model_kwargs would cause a
+        # duplicate-keyword TypeError, so we keep it out of the dict.
         model_kwargs: dict[str, Any] = {}
-        if self.config.thinking_enabled is not None:
-            model_kwargs["thinking_enabled"] = self.config.thinking_enabled
         if self.config.reasoning_effort is not None:
             model_kwargs["reasoning_effort"] = self.config.reasoning_effort
 
@@ -723,8 +725,8 @@ class SubagentExecutor:
                 requested_model=(self.config.model if self.config.model != "inherit" else self.parent_model),
                 effective_model=self.model_name,
                 model_config=model_config,
-                thinking_enabled=False,
-                reasoning_effort=None,
+                thinking_enabled=self.config.thinking_enabled or False,
+                reasoning_effort=self.config.reasoning_effort,
                 rendered_base_prompt=self._assembled_system_prompt,
                 prompt_template_id="deerflow-subagent-v1",
                 tools=tools,

@@ -23,6 +23,7 @@ from datetime import datetime
 from importlib.metadata import version as package_version
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -364,6 +365,136 @@ class TestAgentConstruction:
         assert captured["agent"]["middleware"] is middlewares
         assert captured["agent"]["tools"] == []
         assert captured["agent"]["system_prompt"] is None  # system_prompt is merged into initial state messages
+
+    def test_thinking_enabled_passed_once_to_create_chat_model(
+        self,
+        classes,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """thinking_enabled must appear exactly once in create_chat_model kwargs —
+        not both as a named arg and inside model_kwargs, which would cause TypeError."""
+        import deerflow.config as config_module
+        from deerflow.subagents import executor as executor_module
+
+        SubagentExecutor = classes["SubagentExecutor"]
+        SubagentConfig = classes["SubagentConfig"]
+
+        app_config = SimpleNamespace(
+            models=[SimpleNamespace(name="default-model")],
+            authorization=SimpleNamespace(enabled=False),
+            tool_search=SimpleNamespace(enabled=False),
+            skills=SimpleNamespace(deferred_discovery=True, container_path="/mnt/skills"),
+            skill_evolution=SimpleNamespace(enabled=False),
+        )
+        model = object()
+        middlewares = [object()]
+        agent = object()
+        captured: dict[str, dict] = {}
+
+        def fake_create_chat_model(**kwargs):
+            captured["model"] = kwargs
+            return model
+
+        def fake_build_subagent_runtime_middlewares(**kwargs):
+            captured["middlewares"] = kwargs
+            return middlewares
+
+        def fake_create_agent(**kwargs):
+            captured["agent"] = kwargs
+            return agent
+
+        monkeypatch.setattr(config_module, "get_app_config", _default_app_config)
+        monkeypatch.setattr(executor_module, "create_chat_model", fake_create_chat_model)
+        monkeypatch.setattr(executor_module, "create_agent", fake_create_agent)
+        monkeypatch.setitem(
+            sys.modules,
+            "deerflow.agents.middlewares.tool_error_handling_middleware",
+            _module(
+                "deerflow.agents.middlewares.tool_error_handling_middleware",
+                build_subagent_runtime_middlewares=fake_build_subagent_runtime_middlewares,
+            ),
+        )
+
+        config = SubagentConfig(
+            name="thinker",
+            description="Thinking agent",
+            system_prompt="Think.",
+            max_turns=10,
+            timeout_seconds=60,
+            thinking_enabled=True,
+            reasoning_effort="high",
+        )
+
+        executor = SubagentExecutor(config=config, tools=[], app_config=app_config, parent_model="gpt-5")
+        executor._create_agent()
+
+        # thinking_enabled must be passed exactly once — as a named arg, NOT also via model_kwargs
+        assert captured["model"]["name"] == "gpt-5"
+        assert captured["model"]["thinking_enabled"] is True
+        # reasoning_effort goes through **model_kwargs (not a named param)
+        assert captured["model"]["reasoning_effort"] == "high"
+
+    def test_describe_assembly_uses_actual_thinking_and_reasoning_values(
+        self,
+        classes,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """_describe_assembly must pass actual thinking_enabled/reasoning_effort
+        to build_assembly_descriptor, not hardcoded False/None."""
+
+        SubagentExecutor = classes["SubagentExecutor"]
+        SubagentConfig = classes["SubagentConfig"]
+
+        app_config = _default_app_config()
+        captured: dict[str, Any] = {}
+
+        fake_descriptor = SimpleNamespace(tools=[], middlewares=[], deferred_names=frozenset(), enabled_skills=frozenset())
+
+        def fake_build_assembly_descriptor(**kwargs):
+            captured.update(kwargs)
+            return fake_descriptor
+
+        def fake_notify(descriptor, extensions):
+            pass
+
+        monkeypatch.setitem(
+            sys.modules,
+            "deerflow.agents.assembly_descriptor",
+            _module("deerflow.agents.assembly_descriptor", build_assembly_descriptor=fake_build_assembly_descriptor),
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "deerflow.extensions.notify",
+            _module("deerflow.extensions.notify", notify_agent_assembled=fake_notify),
+        )
+
+        config = SubagentConfig(
+            name="thinker",
+            description="Thinking agent",
+            system_prompt="Think.",
+            max_turns=10,
+            timeout_seconds=60,
+            thinking_enabled=True,
+            reasoning_effort="medium",
+        )
+
+        executor = SubagentExecutor(config=config, tools=[], app_config=app_config, parent_model="gpt-5")
+        executor._assembled_system_prompt = "test prompt"
+        executor._assembled_skills = frozenset()
+
+        fake_extensions = SimpleNamespace(has_agent_assembly_observers=True)
+        executor._describe_assembly(
+            app_config=app_config,
+            tools=[],
+            middlewares=[],
+            deferred_setup=None,
+            extensions=fake_extensions,
+        )
+
+        # The key assertion: thinking_enabled and reasoning_effort must reflect
+        # the actual config values, not the old hardcoded False/None
+        assert captured["thinking_enabled"] is True
+        assert captured["reasoning_effort"] == "medium"
 
     @pytest.mark.anyio
     async def test_load_skills_uses_explicit_app_config_for_skill_storage(
